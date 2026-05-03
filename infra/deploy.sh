@@ -25,7 +25,12 @@ aws ecr get-login-password --region "${AWS_REGION}" \
   | docker login --username AWS --password-stdin "${REGISTRY}"
 
 echo ">> Building image"
-docker build --platform linux/amd64 -t "${ECR_REPO}:latest" .
+# --provenance=false forces a Docker v2 manifest. Buildx defaults to OCI
+# manifests, which Lambda rejects ("image manifest ... not supported").
+docker buildx build --platform linux/amd64 \
+  --provenance=false \
+  --output type=docker \
+  -t "${ECR_REPO}:latest" --load .
 
 echo ">> Tagging and pushing ${IMAGE_URI}"
 docker tag "${ECR_REPO}:latest" "${IMAGE_URI}"

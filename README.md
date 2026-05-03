@@ -112,6 +112,8 @@ The flow is: build image → push to ECR → Lambda runs the container → it re
 
 ### One-time setup
 
+The commands below assume a Unix shell. **On Windows, run them in Git Bash** — CMD and PowerShell will mangle the `$()` expansions, single quotes, and heredocs. The `trust.json` and `s3.json` files in step 3 are written to the project directory (Windows has no `/tmp`); both are in `.gitignore`.
+
 Replace `YOUR_SUFFIX` (S3 bucket names are global) and pick a region.
 
 ```bash
@@ -124,10 +126,14 @@ export API_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(24))')
 echo "API_KEY=${API_KEY}   # save this somewhere safe"
 ```
 
-1. **S3 bucket** for workout JSON:
+1. **S3 bucket** for workout JSON. If deploying to `us-east-1`, omit `--create-bucket-configuration`. For all other regions, include `--create-bucket-configuration LocationConstraint=$AWS_REGION`.
    ```bash
+   # us-east-1:
+   aws s3api create-bucket --bucket "$S3_BUCKET" --region "$AWS_REGION"
+   # any other region:
    aws s3api create-bucket --bucket "$S3_BUCKET" --region "$AWS_REGION" \
-     $( [ "$AWS_REGION" = "us-east-1" ] || echo --create-bucket-configuration LocationConstraint=$AWS_REGION )
+     --create-bucket-configuration LocationConstraint="$AWS_REGION"
+
    aws s3api put-public-access-block --bucket "$S3_BUCKET" \
      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
    ```
@@ -137,30 +143,33 @@ echo "API_KEY=${API_KEY}   # save this somewhere safe"
    aws ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_REGION"
    ```
 
-3. **IAM role** for the Lambda — basic execution + read/write on the bucket:
+3. **IAM role** for the Lambda — basic execution + read/write on the bucket. Run this from the project root; `trust.json` and `s3.json` are gitignored.
    ```bash
-   cat > /tmp/trust.json <<'EOF'
+   cat > trust.json <<'EOF'
    {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}
    EOF
-   aws iam create-role --role-name workout-log-lambda-role --assume-role-policy-document file:///tmp/trust.json
+   aws iam create-role --role-name workout-log-lambda-role --assume-role-policy-document file://trust.json
    aws iam attach-role-policy --role-name workout-log-lambda-role \
      --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
-   cat > /tmp/s3.json <<EOF
+   cat > s3.json <<EOF
    {"Version":"2012-10-17","Statement":[
      {"Effect":"Allow","Action":["s3:PutObject","s3:GetObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::${S3_BUCKET}/*"},
      {"Effect":"Allow","Action":["s3:ListBucket"],"Resource":"arn:aws:s3:::${S3_BUCKET}"}
    ]}
    EOF
    aws iam put-role-policy --role-name workout-log-lambda-role \
-     --policy-name workout-log-s3 --policy-document file:///tmp/s3.json
+     --policy-name workout-log-s3 --policy-document file://s3.json
    ```
 
-4. **First image push** — same as `infra/deploy.sh` but the function doesn't exist yet:
+4. **First image push** — same as `infra/deploy.sh` but the function doesn't exist yet. `--provenance=false` is required because Lambda doesn't support OCI manifests (which buildx defaults to).
    ```bash
    aws ecr get-login-password --region "$AWS_REGION" \
      | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-   docker build --platform linux/amd64 -t "$ECR_REPO:latest" .
+   docker buildx build --platform linux/amd64 \
+     --provenance=false \
+     --output type=docker \
+     -t "$ECR_REPO:latest" --load .
    docker tag "$ECR_REPO:latest" "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:latest"
    docker push "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:latest"
    ```
@@ -176,17 +185,24 @@ echo "API_KEY=${API_KEY}   # save this somewhere safe"
      --environment "Variables={STORAGE_BACKEND=s3,S3_BUCKET=${S3_BUCKET},API_KEY=${API_KEY}}"
    ```
 
-6. **Add a Function URL**:
+6. **Add a Function URL**. As of October 2025, Lambda Function URLs require **both** `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` in the resource policy — public invocation returns 403 if either is missing. Note that `--function-url-auth-type NONE` must NOT be passed for the `lambda:InvokeFunction` statement; that flag is only valid with `lambda:InvokeFunctionUrl`.
    ```bash
    aws lambda create-function-url-config \
      --function-name "$LAMBDA_NAME" --region "$AWS_REGION" \
      --auth-type NONE \
      --cors '{"AllowOrigins":["*"],"AllowMethods":["*"],"AllowHeaders":["*"]}'
+
    aws lambda add-permission \
      --function-name "$LAMBDA_NAME" --region "$AWS_REGION" \
      --statement-id FunctionURLAllowPublicAccess \
      --action lambda:InvokeFunctionUrl \
      --principal '*' --function-url-auth-type NONE
+
+   aws lambda add-permission \
+     --function-name "$LAMBDA_NAME" --region "$AWS_REGION" \
+     --statement-id FunctionURLAllowPublicInvoke \
+     --action lambda:InvokeFunction \
+     --principal '*'
    ```
    The `FunctionUrl` from step 6's output is your endpoint. Auth is enforced at the application layer via `X-API-Key`.
 
@@ -205,6 +221,13 @@ Smoke check after deploy:
 curl "$FUNCTION_URL/healthz"
 curl -H "X-API-Key: $API_KEY" "$FUNCTION_URL/workouts"
 ```
+
+## Troubleshooting
+
+- **`403 Forbidden` from the Function URL.** The Oct 2025 Lambda change requires both `lambda:InvokeFunctionUrl` and `lambda:InvokeFunction` permissions on the function's resource policy. If you set up before then or only added one, run the second `add-permission` call from step 6.
+- **`InvalidParameterValueException: image manifest ... not supported`** when creating or updating the function. The image was pushed with an OCI manifest. Rebuild with `docker buildx build --provenance=false --output type=docker --load` (as in `infra/deploy.sh`).
+- **Cold starts of 3–5 seconds** on the first request after the function has been idle. This is expected for container-image Lambdas; subsequent requests within the warm window are fast.
+- **`create-function` fails with "role cannot be assumed"**. IAM role propagation can lag a few seconds after `create-role`. Wait ~15s and retry.
 
 ## Cost note
 

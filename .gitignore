@@ -5,7 +5,10 @@ venv/
 .pytest_cache/
 .data/
 .env
+.env.*
 .envrc
+trust.json
+s3.json
 *.egg-info/
 dist/
 build/
